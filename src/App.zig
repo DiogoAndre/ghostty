@@ -24,7 +24,7 @@ const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
 /// Fisher-Yates shuffle so every slot is visited once before any
 /// repeats. Reshuffles when the queue is exhausted or when the pool
 /// size changes.
-pub const ThemeSlotDispenser = struct {
+const ThemeSlotDispenser = struct {
     queue: std.ArrayListUnmanaged(u16) = .{},
     cursor: usize = 0,
     pool_len: u16 = 0,

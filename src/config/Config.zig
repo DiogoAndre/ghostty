@@ -613,10 +613,6 @@ theme: ?Theme = null,
 /// honored as you'd expect.
 ///
 /// Use `theme-pool =` on its own line to reset the list.
-///
-/// Note: the runtime wiring (precedence over `theme`, per-surface
-/// slot assignment) is delivered by subsequent commits in this
-/// feature series and is not active as of this commit.
 @"theme-pool": RepeatableTheme = .{},
 
 /// Background color for the window.
@@ -4528,76 +4524,50 @@ fn loadTheme(self: *Config) !void {
     var iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
     try new_config.loadIter(alloc_gpa, &iter);
 
-    // Setup our replay to be conditional.
-    conditional: for (new_config._replay_steps.items) |*item| {
-        switch (item.*) {
-            .expand, .diagnostic => {},
+    // Setup our replay to be conditional. Each replayed arg is tagged
+    // with the current theme (light|dark) and — when loading from a
+    // non-trivial pool — the theme_slot.
+    const alloc_arena = new_config._arena.?.allocator();
+    const using_pool = self.@"theme-pool".list.items.len > 1;
+    const slot_str: ?[]const u8 = if (using_pool) try std.fmt.allocPrint(
+        alloc_arena,
+        "{d}",
+        .{self._conditional_state.theme_slot},
+    ) else null;
+    const extra: usize = if (using_pool) 2 else 1;
 
+    conditional: for (new_config._replay_steps.items) |*item| {
+        const prior_conds: []const Conditional, const arg_str: []const u8 = switch (item.*) {
+            .expand, .diagnostic => continue,
             // If we see "-e" then we do NOT make the following arguments
             // conditional since they are supposed to be part of the
             // initial command.
             .@"-e" => break :conditional,
+            .arg => |v| .{ &.{}, v },
+            .conditional_arg => |v| .{ v.conditions, v.arg },
+        };
 
-            // Change our arg to be conditional on our theme (and optionally
-            // theme_slot when loading from a non-trivial pool).
-            .arg => |v| {
-                const alloc_arena = new_config._arena.?.allocator();
-                const using_pool = self.@"theme-pool".list.items.len > 1;
-                const cond_count: usize = if (using_pool) 2 else 1;
-                const conds = try alloc_arena.alloc(Conditional, cond_count);
-                conds[0] = .{
-                    .key = .theme,
-                    .op = .eq,
-                    .value = @tagName(self._conditional_state.theme),
-                };
-                if (using_pool) {
-                    conds[1] = .{
-                        .key = .theme_slot,
-                        .op = .eq,
-                        .value = try std.fmt.allocPrint(
-                            alloc_arena,
-                            "{d}",
-                            .{self._conditional_state.theme_slot},
-                        ),
-                    };
-                }
-                item.* = .{ .conditional_arg = .{
-                    .conditions = conds,
-                    .arg = v,
-                } };
-            },
-
-            .conditional_arg => |v| {
-                const alloc_arena = new_config._arena.?.allocator();
-                const using_pool = self.@"theme-pool".list.items.len > 1;
-                const extra: usize = if (using_pool) 2 else 1;
-                const conds = try alloc_arena.alloc(
-                    Conditional,
-                    v.conditions.len + extra,
-                );
-                conds[0] = .{
-                    .key = .theme,
-                    .op = .eq,
-                    .value = @tagName(self._conditional_state.theme),
-                };
-                if (using_pool) {
-                    conds[1] = .{
-                        .key = .theme_slot,
-                        .op = .eq,
-                        .value = try std.fmt.allocPrint(
-                            alloc_arena,
-                            "{d}",
-                            .{self._conditional_state.theme_slot},
-                        ),
-                    };
-                }
-                @memcpy(conds[extra..], v.conditions);
-                item.* = .{ .conditional_arg = .{
-                    .conditions = conds,
-                    .arg = v.arg,
-                } };
-            },
+        const conds = try alloc_arena.alloc(
+            Conditional,
+            prior_conds.len + extra,
+        );
+        conds[0] = .{
+            .key = .theme,
+            .op = .eq,
+            .value = @tagName(self._conditional_state.theme),
+        };
+        if (using_pool) {
+            conds[1] = .{
+                .key = .theme_slot,
+                .op = .eq,
+                .value = slot_str.?,
+            };
         }
+        @memcpy(conds[extra..], prior_conds);
+        item.* = .{ .conditional_arg = .{
+            .conditions = conds,
+            .arg = arg_str,
+        } };
     }
 
     // Replay our previous inputs so that we can override values
@@ -10151,10 +10121,6 @@ pub const RepeatableTheme = struct {
             list.appendAssumeCapacity(try item.clone(alloc));
         }
         return .{ .list = list };
-    }
-
-    pub fn count(self: Self) usize {
-        return self.list.items.len;
     }
 
     pub fn equal(self: Self, other: Self) bool {

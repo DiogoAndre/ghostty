@@ -473,7 +473,6 @@ pub fn init(
     rt_surface: *apprt.runtime.Surface,
 ) !void {
     // Draw a theme-pool slot for this surface from the app's dispenser.
-    // For empty or single-slot pools this is a no-op that returns 0.
     const pool_len: u16 = @intCast(config_original.@"theme-pool".list.items.len);
     const slot = try app.theme_dispenser.next(alloc, pool_len);
 
