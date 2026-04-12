@@ -472,10 +472,20 @@ pub fn init(
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
 ) !void {
+    // Draw a theme-pool slot for this surface from the app's dispenser.
+    // For empty or single-slot pools this is a no-op that returns 0.
+    const pool_len: u16 = @intCast(config_original.@"theme-pool".list.items.len);
+    const slot = try app.theme_dispenser.next(alloc, pool_len);
+
+    // Per-surface conditional state inherits the app-level state and
+    // overrides theme_slot with the slot we just drew.
+    var surface_state = app.config_conditional_state;
+    surface_state.theme_slot = slot;
+
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
     var config_: ?configpkg.Config = config_original.changeConditionalState(
-        app.config_conditional_state,
+        surface_state,
     ) catch |err| err: {
         log.warn("failed to apply conditional state to config err={}", .{err});
         break :err null;
@@ -618,7 +628,7 @@ pub fn init(
 
         // Our conditional state is initialized to the app state. This
         // lets us get the most likely correct color theme and so on.
-        .config_conditional_state = app.config_conditional_state,
+        .config_conditional_state = surface_state,
     };
 
     // The command we're going to execute
