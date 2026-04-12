@@ -3830,6 +3830,16 @@ _conditional_set: std.EnumSet(conditional.Key) = .{},
 /// as loadTheme which has more details on why.
 _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 
+/// Whether the CLI explicitly set `theme` (scalar) or `theme-pool`
+/// respectively. Used by `resolveThemeVsThemePool` to give CLI args
+/// precedence over config-file sources when the two keys collide —
+/// config files loaded via `--config-file` get appended to
+/// `_replay_steps` after CLI args, so naive load-order-last-wins
+/// would hand the win to the config file, contradicting user
+/// intuition that CLI flags override config.
+_cli_set_theme: bool = false,
+_cli_set_theme_pool: bool = false,
+
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
 
@@ -4182,10 +4192,43 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
         inline for (fields) |field| @field(self, field).overwrite_next = false;
     }
 
+    // Record the replay-step index at which CLI parsing begins so we
+    // can later tell whether `theme` / `theme-pool` were set by the CLI
+    // (for mutual-clear precedence over config-file sources).
+    const cli_replay_start = self._replay_steps.items.len;
+
     // Initialize our CLI iterator.
     var iter = try cli.args.argsIterator(alloc_gpa);
     defer iter.deinit();
     try self.loadIter(alloc_gpa, &iter);
+
+    // Scan the CLI-originated replay steps for theme/theme-pool
+    // assignments and record them. This lets `resolveThemeVsThemePool`
+    // give CLI args precedence over config-file sources when the two
+    // keys collide, matching user intuition that CLI flags override
+    // config.
+    for (self._replay_steps.items[cli_replay_start..]) |step| {
+        const raw_arg: []const u8 = switch (step) {
+            .arg => |v| v,
+            else => continue,
+        };
+        const arg = if (std.mem.startsWith(u8, raw_arg, "--"))
+            raw_arg[2..]
+        else
+            raw_arg;
+        if (std.mem.startsWith(u8, arg, "theme-pool=")) {
+            // Empty-value reset (`theme-pool=`) does not count as
+            // "setting" the pool — it clears the list.
+            if (!std.mem.eql(u8, arg, "theme-pool=")) {
+                self._cli_set_theme_pool = true;
+            }
+        } else if (std.mem.startsWith(u8, arg, "theme=")) {
+            // Empty-value reset (`theme=`) does not count as "setting".
+            if (!std.mem.eql(u8, arg, "theme=")) {
+                self._cli_set_theme = true;
+            }
+        }
+    }
 
     // If we are not loading the default files, then we need to
     // replay the steps up to this point so that we can rebuild
@@ -4567,19 +4610,39 @@ fn loadTheme(self: *Config) !void {
     self.* = new_config;
 }
 
-/// Reconcile `theme` and `theme-pool` when both are set. Whichever
-/// key's last assignment appears latest in `_replay_steps` wins; the
-/// other is cleared. Empty-value `--theme-pool=` steps are not treated
-/// as "setting" the pool for the purposes of mutual clear — but by the
-/// time this runs, any empty reset has already cleared the list, so
-/// the outer `if` guard handles that case naturally.
+/// Reconcile `theme` and `theme-pool` when both are set. The rules,
+/// in priority order:
+///
+///   1. If the CLI explicitly set exactly one of the two keys, that
+///      one wins — config files (including those loaded via
+///      `--config-file`) cannot override a CLI flag. This matches the
+///      intuition that CLI args are the boss.
+///   2. Otherwise, scan `_replay_steps` in reverse and pick the
+///      most-recently-assigned key (load-order last-wins). This covers
+///      "both set by CLI" (reverse scan finds the later CLI arg) and
+///      "both set by files" (reverse scan finds the later file entry).
+///
+/// Empty-value `--theme-pool=` steps are not treated as "setting" the
+/// pool — by the time this runs any empty reset has already cleared
+/// the list, so the outer `if` guard handles that case naturally.
 fn resolveThemeVsThemePool(self: *Config) void {
     const pool_set = self.@"theme-pool".list.items.len > 0;
     const scalar_set = self.theme != null;
     if (!pool_set or !scalar_set) return;
 
-    // Scan from the end: the first arg we find referencing theme or
-    // theme-pool is the winner.
+    // Rule 1: CLI precedence. If the CLI explicitly set exactly one of
+    // the two keys, that one wins regardless of what happened later in
+    // config-file land.
+    if (self._cli_set_theme and !self._cli_set_theme_pool) {
+        self.@"theme-pool".list.clearRetainingCapacity();
+        return;
+    }
+    if (self._cli_set_theme_pool and !self._cli_set_theme) {
+        self.theme = null;
+        return;
+    }
+
+    // Rule 2: reverse-scan the replay steps for load-order last-wins.
     var i: usize = self._replay_steps.items.len;
     while (i > 0) {
         i -= 1;
@@ -11038,6 +11101,77 @@ test "theme-pool last-wins across interleaved assignments" {
     try testing.expectEqual(@as(usize, 2), cfg.@"theme-pool".list.items.len);
     try testing.expectEqualStrings("a", cfg.@"theme-pool".list.items[0].light);
     try testing.expectEqualStrings("b", cfg.@"theme-pool".list.items[1].light);
+}
+
+test "cli theme overrides config-file theme-pool" {
+    // Simulates `ghostty --config-file=X --theme=Nord` where X contains
+    // `theme-pool = ...`. CLI `--theme` should win even though the
+    // config file's pool entries are appended to _replay_steps AFTER
+    // the CLI arg (because loadRecursiveFiles runs after loadCliArgs).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // First, simulate the CLI scalar assignment and mark it as
+    // CLI-originated (as loadCliArgs would).
+    var cli_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=Nord"),
+    } };
+    try cfg.loadIter(alloc, &cli_it);
+    cfg._cli_set_theme = true;
+
+    // Next, simulate a config file loaded via loadRecursiveFiles
+    // appending pool entries to the replay steps AFTER the CLI.
+    var file_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=Dracula"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=Gruvbox Dark"),
+    } };
+    try cfg.loadIter(alloc, &file_it);
+
+    try cfg.finalize();
+
+    // CLI scalar should win — pool must be cleared.
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("Nord", cfg.theme.?.light);
+    try testing.expectEqual(@as(usize, 0), cfg.@"theme-pool".list.items.len);
+}
+
+test "cli theme-pool overrides config-file scalar theme" {
+    // Inverse: `ghostty --theme-pool=X --config-file=Y` where Y
+    // contains `theme = Z`. CLI `--theme-pool` should win.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var cli_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=Dracula"),
+    } };
+    try cfg.loadIter(alloc, &cli_it);
+    cfg._cli_set_theme_pool = true;
+
+    var file_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=Nord"),
+    } };
+    try cfg.loadIter(alloc, &file_it);
+
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 1), cfg.@"theme-pool".list.items.len);
+    try testing.expectEqualStrings(
+        "Dracula",
+        cfg.@"theme-pool".list.items[0].light,
+    );
 }
 
 test "theme loading correct light/dark" {
