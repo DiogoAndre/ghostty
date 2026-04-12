@@ -4495,15 +4495,29 @@ fn loadTheme(self: *Config) !void {
             // initial command.
             .@"-e" => break :conditional,
 
-            // Change our arg to be conditional on our theme.
+            // Change our arg to be conditional on our theme (and optionally
+            // theme_slot when loading from a non-trivial pool).
             .arg => |v| {
                 const alloc_arena = new_config._arena.?.allocator();
-                const conds = try alloc_arena.alloc(Conditional, 1);
+                const using_pool = self.@"theme-pool".list.items.len > 1;
+                const cond_count: usize = if (using_pool) 2 else 1;
+                const conds = try alloc_arena.alloc(Conditional, cond_count);
                 conds[0] = .{
                     .key = .theme,
                     .op = .eq,
                     .value = @tagName(self._conditional_state.theme),
                 };
+                if (using_pool) {
+                    conds[1] = .{
+                        .key = .theme_slot,
+                        .op = .eq,
+                        .value = try std.fmt.allocPrint(
+                            alloc_arena,
+                            "{d}",
+                            .{self._conditional_state.theme_slot},
+                        ),
+                    };
+                }
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
                     .arg = v,
@@ -4512,13 +4526,29 @@ fn loadTheme(self: *Config) !void {
 
             .conditional_arg => |v| {
                 const alloc_arena = new_config._arena.?.allocator();
-                const conds = try alloc_arena.alloc(Conditional, v.conditions.len + 1);
+                const using_pool = self.@"theme-pool".list.items.len > 1;
+                const extra: usize = if (using_pool) 2 else 1;
+                const conds = try alloc_arena.alloc(
+                    Conditional,
+                    v.conditions.len + extra,
+                );
                 conds[0] = .{
                     .key = .theme,
                     .op = .eq,
                     .value = @tagName(self._conditional_state.theme),
                 };
-                @memcpy(conds[1..], v.conditions);
+                if (using_pool) {
+                    conds[1] = .{
+                        .key = .theme_slot,
+                        .op = .eq,
+                        .value = try std.fmt.allocPrint(
+                            alloc_arena,
+                            "{d}",
+                            .{self._conditional_state.theme_slot},
+                        ),
+                    };
+                }
+                @memcpy(conds[extra..], v.conditions);
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
                     .arg = v.arg,
@@ -11337,4 +11367,51 @@ test "theme-pool clamps out-of-range slot to last valid" {
     try cfg.finalize();
 
     try testing.expectEqual(Color{ .r = 0, .g = 0xbb, .b = 0 }, cfg.background);
+}
+
+test "changeConditionalState switches theme-pool slot" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Slot 0 → background #aa0000
+    try testing.expectEqual(Color{ .r = 0xaa, .g = 0, .b = 0 }, cfg.background);
+
+    // Flip to slot 1 → background #00bb00
+    var cfg2 = (try cfg.changeConditionalState(.{ .theme_slot = 1 })).?;
+    defer cfg2.deinit();
+    try testing.expectEqual(Color{ .r = 0, .g = 0xbb, .b = 0 }, cfg2.background);
 }
