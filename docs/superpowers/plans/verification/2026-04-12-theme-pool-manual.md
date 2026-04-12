@@ -35,8 +35,8 @@ Two pre-written test config files:
 5. After 10 surfaces total, every slot should have been seen at least twice
 
 **Expected:** ✅ distinct themes, shuffle covers the pool before repeating, no crashes
-**Result:** _PASS / FAIL_
-**Notes:** _
+**Result:** PASS
+**Notes:** Verified.
 
 ### Step 2 — Light/dark stickiness
 
@@ -47,8 +47,8 @@ Two pre-written test config files:
 5. Do NOT let the surfaces swap slots — slot identity is sticky
 
 **Expected:** ✅ each surface keeps its slot, light/dark flips within the slot
-**Result:** _PASS / FAIL_
-**Notes:** _
+**Result:** PASS
+**Notes:** Verified.
 
 ### Step 3 — Out-of-range clamp with config reload
 
@@ -63,8 +63,8 @@ Two pre-written test config files:
    - Expect entries like: `theme_slot 3 out of range (pool size 2), falling back to slot 1`
 
 **Expected:** ✅ clamped surfaces render to slot 1; debug log present
-**Result:** _PASS / FAIL_
-**Notes:** _
+**Result:** PASS
+**Notes:** Clamp works cleanly — surfaces previously on slots 2/3/4 fell back to slot 1, and the debug log showed `theme_slot N out of range` entries.
 
 ### Step 4 — CLI override clears pool
 
@@ -73,17 +73,26 @@ Two pre-written test config files:
 3. Observe: ALL surfaces use Nord (not the pool). The CLI `--theme=Nord` is parsed after the config file, and the `resolveThemeVsThemePool` helper clears the pool because `theme=` was the most-recently-assigned key
 
 **Expected:** ✅ all surfaces use Nord, pool is ignored
-**Result:** _PASS / FAIL_
-**Notes:** _
+**Result:** PASS (after fix)
+**Notes:** Initial run exposed a real bug: config files loaded via `--config-file` append to `_replay_steps` AFTER CLI args, so the reverse-scan mutual-clear handed the win to the pool. Fixed in commit `3e6015bf7` by tracking CLI-origin flags and giving them precedence over the reverse scan. Re-verified with fresh build + ad-hoc codesign.
 
 ## Summary
 
-- Step 1 (distinct themes across 6+ surfaces): _PASS / FAIL_
-- Step 2 (light/dark stickiness): _PASS / FAIL_
-- Step 3 (out-of-range clamp + debug log): _PASS / FAIL_
-- Step 4 (CLI override clears pool): _PASS / FAIL_
+- Step 1 (distinct themes across 6+ surfaces): PASS
+- Step 2 (light/dark stickiness): PASS
+- Step 3 (out-of-range clamp + debug log): PASS
+- Step 4 (CLI override clears pool): PASS (after fix in `3e6015bf7`)
 
-**Overall:** _PASS / FAIL_
+**Overall:** PASS
 
 **Verifier notes:**
-_Fill in any observations, edge cases encountered, or issues to fix before merge._
+Manual verification surfaced one real bug (Step 4) that wasn't covered by the
+automated test suite — CLI args loaded before `loadRecursiveFiles` meant the
+reverse-scan mutual-clear gave priority to config-file pool entries over an
+explicit CLI `--theme=` flag. Fix is committed with two regression tests
+exercising CLI-precedence in both directions.
+
+All other steps passed on first attempt. Runtime behavior matches the design:
+per-surface slot assignment via Fisher-Yates shuffle is visually distinct,
+light/dark stickiness honors the slot identity across system appearance
+toggles, and the out-of-range clamp falls back silently with a debug log.
