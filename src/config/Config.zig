@@ -9904,6 +9904,139 @@ pub const Theme = struct {
     }
 };
 
+/// A list of Theme entries used by the `theme-pool` config key. Each
+/// entry is a slot — surfaces pick a slot to determine their theme.
+pub const RepeatableTheme = struct {
+    const Self = @This();
+
+    list: std.ArrayListUnmanaged(Theme) = .{},
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
+        const value = input orelse return error.ValueRequired;
+
+        // Empty value resets the list.
+        if (value.len == 0) {
+            self.list.clearRetainingCapacity();
+            return;
+        }
+
+        // Reuse the existing Theme.parseCLI for per-slot parsing so both
+        // single-name and `light:X,dark:Y` syntax work unchanged.
+        var slot: Theme = undefined;
+        try slot.parseCLI(alloc, value);
+        try self.list.append(alloc, slot);
+    }
+
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        var list = try std.ArrayListUnmanaged(Theme).initCapacity(
+            alloc,
+            self.list.items.len,
+        );
+        errdefer {
+            for (list.items) |item| {
+                alloc.free(item.light);
+                alloc.free(item.dark);
+            }
+            list.deinit(alloc);
+        }
+        for (self.list.items) |item| {
+            list.appendAssumeCapacity(try item.clone(alloc));
+        }
+        return .{ .list = list };
+    }
+
+    pub fn count(self: Self) usize {
+        return self.list.items.len;
+    }
+
+    pub fn equal(self: Self, other: Self) bool {
+        const a = self.list.items;
+        const b = other.list.items;
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (!std.mem.eql(u8, x.light, y.light)) return false;
+            if (!std.mem.eql(u8, x.dark, y.dark)) return false;
+        }
+        return true;
+    }
+
+    pub fn formatEntry(self: Self, formatter: anytype) !void {
+        if (self.list.items.len == 0) {
+            try formatter.formatEntry(void, {});
+            return;
+        }
+        for (self.list.items) |slot| {
+            try slot.formatEntry(formatter);
+        }
+    }
+
+    test "parseCLI single" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try testing.expectEqual(@as(usize, 1), pool.list.items.len);
+        try testing.expectEqualStrings("nord", pool.list.items[0].light);
+        try testing.expectEqualStrings("nord", pool.list.items[0].dark);
+    }
+
+    test "parseCLI light/dark pair" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "light:rose-pine-dawn,dark:rose-pine");
+        try testing.expectEqual(@as(usize, 1), pool.list.items.len);
+        try testing.expectEqualStrings("rose-pine-dawn", pool.list.items[0].light);
+        try testing.expectEqualStrings("rose-pine", pool.list.items[0].dark);
+    }
+
+    test "parseCLI accumulates" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try pool.parseCLI(alloc, "dracula");
+        try pool.parseCLI(alloc, "light:a,dark:b");
+        try testing.expectEqual(@as(usize, 3), pool.list.items.len);
+        try testing.expectEqualStrings("nord", pool.list.items[0].light);
+        try testing.expectEqualStrings("dracula", pool.list.items[1].light);
+        try testing.expectEqualStrings("a", pool.list.items[2].light);
+        try testing.expectEqualStrings("b", pool.list.items[2].dark);
+    }
+
+    test "parseCLI empty resets" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try pool.parseCLI(alloc, "dracula");
+        try pool.parseCLI(alloc, "");
+        try testing.expectEqual(@as(usize, 0), pool.list.items.len);
+    }
+
+    test "parseCLI null errors" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try testing.expectError(error.ValueRequired, pool.parseCLI(alloc, null));
+    }
+};
+
 pub const Duration = struct {
     /// Duration in nanoseconds
     duration: u64 = 0,
