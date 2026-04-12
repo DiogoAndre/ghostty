@@ -4514,9 +4514,58 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     self.* = new_config;
 }
 
+/// Reconcile `theme` and `theme-pool` when both are set. Whichever
+/// key's last assignment appears latest in `_replay_steps` wins; the
+/// other is cleared. Empty-value `--theme-pool=` steps are not treated
+/// as "setting" the pool for the purposes of mutual clear — but by the
+/// time this runs, any empty reset has already cleared the list, so
+/// the outer `if` guard handles that case naturally.
+fn resolveThemeVsThemePool(self: *Config) void {
+    const pool_set = self.@"theme-pool".list.items.len > 0;
+    const scalar_set = self.theme != null;
+    if (!pool_set or !scalar_set) return;
+
+    // Scan from the end: the first arg we find referencing theme or
+    // theme-pool is the winner.
+    var i: usize = self._replay_steps.items.len;
+    while (i > 0) {
+        i -= 1;
+        const step = self._replay_steps.items[i];
+        const raw_arg: []const u8 = switch (step) {
+            .arg => |v| v,
+            .conditional_arg => |v| v.arg,
+            else => continue,
+        };
+        // Strip the leading `--` if present.
+        const arg = if (std.mem.startsWith(u8, raw_arg, "--"))
+            raw_arg[2..]
+        else
+            raw_arg;
+
+        if (std.mem.startsWith(u8, arg, "theme-pool=")) {
+            // Pool wins — clear scalar.
+            self.theme = null;
+            return;
+        }
+        if (std.mem.startsWith(u8, arg, "theme=")) {
+            // Scalar wins — clear pool.
+            self.@"theme-pool".list.clearRetainingCapacity();
+            return;
+        }
+    }
+
+    // If we reach here, both fields were set but neither appeared in
+    // the replay steps (e.g., programmatic field assignment in tests).
+    // Leave both as-is; loadTheme will prefer the pool.
+}
+
 /// Call this once after you are done setting configuration. This
 /// is idempotent but will waste memory if called multiple times.
 pub fn finalize(self: *Config) !void {
+    // Resolve mutual-clear between `theme` and `theme-pool` based on
+    // load order in _replay_steps.
+    self.resolveThemeVsThemePool();
+
     // We always load the theme first because it may set other fields
     // in our config.
     if (self.theme) |theme| {
@@ -10830,6 +10879,97 @@ test "theme-pool parses into Config field" {
     try testing.expectEqualStrings("nord", cfg.@"theme-pool".list.items[0].dark);
     try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].light);
     try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].dark);
+}
+
+test "theme-pool clears scalar theme when set after" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 1), cfg.@"theme-pool".list.items.len);
+}
+
+test "scalar theme clears theme-pool when set after" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(@as(usize, 0), cfg.@"theme-pool".list.items.len);
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("nord", cfg.theme.?.light);
+}
+
+test "empty theme-pool does not clear scalar theme" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool="),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("nord", cfg.theme.?.light);
+}
+
+test "theme-pool last-wins across interleaved assignments" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Sequence: pool(a) -> scalar(nord) -> pool(b). Pool wins overall
+    // because the last step assigns theme-pool, and the reverse scan
+    // must find that last entry, not the earlier one.
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=a"),
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=b"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 2), cfg.@"theme-pool".list.items.len);
+    try testing.expectEqualStrings("a", cfg.@"theme-pool".list.items[0].light);
+    try testing.expectEqualStrings("b", cfg.@"theme-pool".list.items[1].light);
 }
 
 test "theme loading correct light/dark" {
