@@ -13,6 +13,10 @@ pub const State = struct {
     /// The target OS of the current build.
     os: std.Target.Os.Tag = builtin.target.os.tag,
 
+    /// Index into the theme-pool slots list for this surface. Zero
+    /// when no pool is active (default).
+    theme_slot: u16 = 0,
+
     pub const Theme = enum { light, dark };
 
     /// Tests the conditional against the state and returns true if it matches.
@@ -21,11 +25,19 @@ pub const State = struct {
             inline else => |tag| {
                 // The raw value of the state field.
                 const raw = @field(self, @tagName(tag));
+                const FieldType = @TypeOf(raw);
 
-                // Since all values are enums currently then we can just
-                // do this. If we introduce non-enum state values then this
-                // will be a compile error and we should fix here.
-                const value: []const u8 = @tagName(raw);
+                // Format the raw value as a string for comparison. Enum
+                // fields use @tagName; integer fields use std.fmt.
+                var buf: [32]u8 = undefined;
+                const value: []const u8 = switch (@typeInfo(FieldType)) {
+                    .@"enum" => @tagName(raw),
+                    .int => std.fmt.bufPrint(&buf, "{d}", .{raw}) catch unreachable,
+                    else => @compileError(
+                        "unsupported conditional state field type: " ++
+                            @typeName(FieldType),
+                    ),
+                };
 
                 return switch (cond.op) {
                     .eq => std.mem.eql(u8, value, cond.value),
@@ -90,5 +102,33 @@ test "conditional enum match" {
         .key = .theme,
         .op = .ne,
         .value = "light",
+    }));
+}
+
+test "conditional theme_slot match" {
+    const testing = std.testing;
+    const state: State = .{ .theme_slot = 2 };
+    try testing.expect(state.match(.{
+        .key = .theme_slot,
+        .op = .eq,
+        .value = "2",
+    }));
+    try testing.expect(!state.match(.{
+        .key = .theme_slot,
+        .op = .eq,
+        .value = "3",
+    }));
+    try testing.expect(state.match(.{
+        .key = .theme_slot,
+        .op = .ne,
+        .value = "3",
+    }));
+
+    // Default theme_slot is 0 — the "no pool active" sentinel.
+    const default_state: State = .{};
+    try testing.expect(default_state.match(.{
+        .key = .theme_slot,
+        .op = .eq,
+        .value = "0",
     }));
 }
