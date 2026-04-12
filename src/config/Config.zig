@@ -591,6 +591,34 @@ language: ?[:0]const u8 = null,
 ///   - macOS: titlebar tabs style is not updated when switching themes.
 theme: ?Theme = null,
 
+/// A list of themes from which each new surface (window, tab, or split)
+/// randomly draws one at creation time. Entries use the same per-slot
+/// syntax as `theme`: a single name or a `light:X,dark:Y` pair.
+///
+/// When `theme-pool` is non-empty, it takes precedence over `theme`.
+/// Setting `theme` after `theme-pool` (or `theme-pool` after `theme`)
+/// clears the other — whichever was assigned most recently in load
+/// order wins.
+///
+/// Example:
+///
+///     theme-pool = nord
+///     theme-pool = dracula
+///     theme-pool = light:rose-pine-dawn,dark:rose-pine
+///
+/// Each new surface picks randomly without repeats until every slot
+/// has been used, then reshuffles. A surface keeps its slot across
+/// config reload and system light/dark switches — the slot is the
+/// surface's identity, and within a slot the light/dark pair is
+/// honored as you'd expect.
+///
+/// Use `theme-pool =` on its own line to reset the list.
+///
+/// Note: the runtime wiring (precedence over `theme`, per-surface
+/// slot assignment) is delivered by subsequent commits in this
+/// feature series and is not active as of this commit.
+@"theme-pool": RepeatableTheme = .{},
+
 /// Background color for the window.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 background: Color = .{ .r = 0x28, .g = 0x2C, .b = 0x34 },
@@ -10775,6 +10803,33 @@ test "theme priority is lower than config" {
         .g = 0xCD,
         .b = 0xEF,
     }, cfg.background);
+}
+
+test "theme-pool parses into Config field" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(
+        @as(usize, 2),
+        cfg.@"theme-pool".list.items.len,
+    );
+    try testing.expectEqualStrings("nord", cfg.@"theme-pool".list.items[0].light);
+    try testing.expectEqualStrings("nord", cfg.@"theme-pool".list.items[0].dark);
+    try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].light);
+    try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].dark);
 }
 
 test "theme loading correct light/dark" {
