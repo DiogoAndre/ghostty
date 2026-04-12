@@ -4418,7 +4418,30 @@ fn expandPaths(self: *Config, base: []const u8) !void {
     }
 }
 
-fn loadTheme(self: *Config, theme: Theme) !void {
+fn loadTheme(self: *Config) !void {
+    // Pick which Theme struct to load: a pool slot if the pool is
+    // non-empty, otherwise the scalar `theme`. The caller (finalize)
+    // only invokes loadTheme when at least one of the two is set.
+    const theme: Theme = theme: {
+        const slots = self.@"theme-pool".list.items;
+        if (slots.len > 0) {
+            // Clamp at usize level first so we never @intCast a value
+            // larger than u16 fits, even for implausibly large pools.
+            const requested: usize = self._conditional_state.theme_slot;
+            const max_slot: usize = slots.len - 1;
+            const slot_idx: usize = @min(requested, max_slot);
+            if (requested > max_slot) {
+                log.debug(
+                    "theme_slot {d} out of range (pool size {d}), " ++
+                        "falling back to slot {d}",
+                    .{ requested, slots.len, slot_idx },
+                );
+            }
+            break :theme slots[slot_idx];
+        }
+        break :theme self.theme orelse return;
+    };
+
     // Load the correct theme depending on the conditional state.
     // Dark/light themes were programmed prior to conditional configuration
     // so when we introduce that we probably want to replace this.
@@ -4568,22 +4591,37 @@ pub fn finalize(self: *Config) !void {
 
     // We always load the theme first because it may set other fields
     // in our config.
-    if (self.theme) |theme| {
-        const different = !std.mem.eql(u8, theme.light, theme.dark);
+    const pool_len = self.@"theme-pool".list.items.len;
+    const has_theme = self.theme != null or pool_len > 0;
+    if (has_theme) {
+        // Capture whether any slot (or scalar) has a distinct light/dark
+        // pair before loadTheme swaps self out from under us.
+        const any_different_mode = different: {
+            if (self.theme) |t| {
+                if (!std.mem.eql(u8, t.light, t.dark)) break :different true;
+            }
+            for (self.@"theme-pool".list.items) |slot| {
+                if (!std.mem.eql(u8, slot.light, slot.dark)) break :different true;
+            }
+            break :different false;
+        };
 
         // Warning: loadTheme will deinit our existing config and replace
         // it so all memory from self prior to this point will be freed.
-        try self.loadTheme(theme);
+        try self.loadTheme();
 
-        // If we have different light vs dark mode themes, disable
-        // window-theme = auto since that breaks it.
-        if (different) {
-            // This setting doesn't make sense with different light/dark themes
-            // because it'll force the theme based on the Ghostty theme.
+        // If any slot has distinct light/dark, force window-theme=system
+        // and mark theme as conditional (matches prior behavior).
+        if (any_different_mode) {
             if (self.@"window-theme" == .auto) self.@"window-theme" = .system;
-
-            // Mark that we use a conditional theme
             self._conditional_set.insert(.theme);
+        }
+
+        // If the pool has more than one slot, theme_slot varies between
+        // surfaces — mark it as conditional so changeConditionalState
+        // notices changes.
+        if (pool_len > 1) {
+            self._conditional_set.insert(.theme_slot);
         }
     }
 
@@ -11212,4 +11250,91 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "theme-pool loads slot 0 background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+
+    // Write two theme files into a tempdir.
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Default theme_slot is 0 → slot A background.
+    try testing.expectEqual(Color{ .r = 0xaa, .g = 0, .b = 0 }, cfg.background);
+}
+
+test "theme-pool clamps out-of-range slot to last valid" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    // Pool has 2 slots; ask for slot 5 → should clamp to slot 1 (last valid).
+    cfg._conditional_state = .{ .theme_slot = 5 };
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(Color{ .r = 0, .g = 0xbb, .b = 0 }, cfg.background);
 }
