@@ -20,6 +20,55 @@ const log = std.log.scoped(.app);
 
 const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
 
+/// Hands out theme-pool slot indices to newly-created surfaces. Uses a
+/// Fisher-Yates shuffle so every slot is visited once before any
+/// repeats. Reshuffles when the queue is exhausted or when the pool
+/// size changes.
+const ThemeSlotDispenser = struct {
+    queue: std.ArrayListUnmanaged(u16) = .{},
+    cursor: usize = 0,
+    rng: std.Random.DefaultPrng,
+
+    pub fn init() ThemeSlotDispenser {
+        return .{
+            .rng = std.Random.DefaultPrng.init(std.crypto.random.int(u64)),
+        };
+    }
+
+    pub fn deinit(self: *ThemeSlotDispenser, alloc: Allocator) void {
+        self.queue.deinit(alloc);
+    }
+
+    /// Return the next slot index for a pool of `pool_len` slots. For
+    /// pool_len <= 1 always returns 0 and does not allocate.
+    pub fn next(
+        self: *ThemeSlotDispenser,
+        alloc: Allocator,
+        pool_len: u16,
+    ) Allocator.Error!u16 {
+        if (pool_len <= 1) return 0;
+        if (self.queue.items.len != pool_len or self.cursor >= self.queue.items.len) {
+            try self.reshuffle(alloc, pool_len);
+        }
+        const slot = self.queue.items[self.cursor];
+        self.cursor += 1;
+        return slot;
+    }
+
+    fn reshuffle(
+        self: *ThemeSlotDispenser,
+        alloc: Allocator,
+        pool_len: u16,
+    ) Allocator.Error!void {
+        self.queue.clearRetainingCapacity();
+        try self.queue.ensureTotalCapacity(alloc, pool_len);
+        var i: u16 = 0;
+        while (i < pool_len) : (i += 1) self.queue.appendAssumeCapacity(i);
+        self.rng.random().shuffle(u16, self.queue.items);
+        self.cursor = 0;
+    }
+};
+
 /// General purpose allocator
 alloc: Allocator,
 
@@ -64,6 +113,9 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
+/// Draws theme-pool slot indices for newly-created surfaces.
+theme_dispenser: ThemeSlotDispenser,
+
 /// Set to false once we've created at least one surface. This
 /// never goes true again. This can be used by surfaces to determine
 /// if they are the first surface.
@@ -99,6 +151,7 @@ pub fn init(
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
+        .theme_dispenser = ThemeSlotDispenser.init(),
     };
 }
 
@@ -106,6 +159,8 @@ pub fn deinit(self: *App) void {
     // Clean up all our surfaces
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
+
+    self.theme_dispenser.deinit(self.alloc);
 
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
@@ -621,3 +676,58 @@ pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
     //     }
     // }
 };
+
+test "ThemeSlotDispenser short-circuits for pool_len <= 1" {
+    const testing = std.testing;
+    var d = ThemeSlotDispenser.init();
+    defer d.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u16, 0), try d.next(testing.allocator, 0));
+    try testing.expectEqual(@as(u16, 0), try d.next(testing.allocator, 1));
+    try testing.expectEqual(@as(u16, 0), try d.next(testing.allocator, 1));
+}
+
+test "ThemeSlotDispenser visits every slot before repeating" {
+    const testing = std.testing;
+    var d = ThemeSlotDispenser.init();
+    defer d.deinit(testing.allocator);
+
+    const pool_len: u16 = 4;
+    var seen: [pool_len]bool = .{false} ** pool_len;
+    for (0..pool_len) |_| {
+        const slot = try d.next(testing.allocator, pool_len);
+        try testing.expect(slot < pool_len);
+        try testing.expect(!seen[slot]);
+        seen[slot] = true;
+    }
+    // All four slots were visited exactly once.
+    for (seen) |s| try testing.expect(s);
+}
+
+test "ThemeSlotDispenser reshuffles when queue exhausted" {
+    const testing = std.testing;
+    var d = ThemeSlotDispenser.init();
+    defer d.deinit(testing.allocator);
+
+    const pool_len: u16 = 3;
+    // Consume three slots.
+    _ = try d.next(testing.allocator, pool_len);
+    _ = try d.next(testing.allocator, pool_len);
+    _ = try d.next(testing.allocator, pool_len);
+    // Fourth call must not panic; must return a valid slot.
+    const fourth = try d.next(testing.allocator, pool_len);
+    try testing.expect(fourth < pool_len);
+}
+
+test "ThemeSlotDispenser reshuffles on pool size change" {
+    const testing = std.testing;
+    var d = ThemeSlotDispenser.init();
+    defer d.deinit(testing.allocator);
+
+    _ = try d.next(testing.allocator, 3);
+    _ = try d.next(testing.allocator, 3);
+    // Pool grows; next call should reshuffle and return a valid index.
+    const next = try d.next(testing.allocator, 5);
+    try testing.expect(next < 5);
+    try testing.expectEqual(@as(usize, 5), d.queue.items.len);
+}

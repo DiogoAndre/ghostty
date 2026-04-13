@@ -591,6 +591,30 @@ language: ?[:0]const u8 = null,
 ///   - macOS: titlebar tabs style is not updated when switching themes.
 theme: ?Theme = null,
 
+/// A list of themes from which each new surface (window, tab, or split)
+/// randomly draws one at creation time. Entries use the same per-slot
+/// syntax as `theme`: a single name or a `light:X,dark:Y` pair.
+///
+/// When `theme-pool` is non-empty, it takes precedence over `theme`.
+/// Setting `theme` after `theme-pool` (or `theme-pool` after `theme`)
+/// clears the other — whichever was assigned most recently in load
+/// order wins.
+///
+/// Example:
+///
+///     theme-pool = nord
+///     theme-pool = dracula
+///     theme-pool = light:rose-pine-dawn,dark:rose-pine
+///
+/// Each new surface picks randomly without repeats until every slot
+/// has been used, then reshuffles. A surface keeps its slot across
+/// config reload and system light/dark switches — the slot is the
+/// surface's identity, and within a slot the light/dark pair is
+/// honored as you'd expect.
+///
+/// Use `theme-pool =` on its own line to reset the list.
+@"theme-pool": RepeatableTheme = .{},
+
 /// Background color for the window.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 background: Color = .{ .r = 0x28, .g = 0x2C, .b = 0x34 },
@@ -3802,6 +3826,16 @@ _conditional_set: std.EnumSet(conditional.Key) = .{},
 /// as loadTheme which has more details on why.
 _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 
+/// Whether the CLI explicitly set `theme` (scalar) or `theme-pool`
+/// respectively. Used by `resolveThemeVsThemePool` to give CLI args
+/// precedence over config-file sources when the two keys collide —
+/// config files loaded via `--config-file` get appended to
+/// `_replay_steps` after CLI args, so naive load-order-last-wins
+/// would hand the win to the config file, contradicting user
+/// intuition that CLI flags override config.
+_cli_set_theme: bool = false,
+_cli_set_theme_pool: bool = false,
+
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
 
@@ -4154,10 +4188,43 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
         inline for (fields) |field| @field(self, field).overwrite_next = false;
     }
 
+    // Record the replay-step index at which CLI parsing begins so we
+    // can later tell whether `theme` / `theme-pool` were set by the CLI
+    // (for mutual-clear precedence over config-file sources).
+    const cli_replay_start = self._replay_steps.items.len;
+
     // Initialize our CLI iterator.
     var iter = try cli.args.argsIterator(alloc_gpa);
     defer iter.deinit();
     try self.loadIter(alloc_gpa, &iter);
+
+    // Scan the CLI-originated replay steps for theme/theme-pool
+    // assignments and record them. This lets `resolveThemeVsThemePool`
+    // give CLI args precedence over config-file sources when the two
+    // keys collide, matching user intuition that CLI flags override
+    // config.
+    for (self._replay_steps.items[cli_replay_start..]) |step| {
+        const raw_arg: []const u8 = switch (step) {
+            .arg => |v| v,
+            else => continue,
+        };
+        const arg = if (std.mem.startsWith(u8, raw_arg, "--"))
+            raw_arg[2..]
+        else
+            raw_arg;
+        if (std.mem.startsWith(u8, arg, "theme-pool=")) {
+            // Empty-value reset (`theme-pool=`) does not count as
+            // "setting" the pool — it clears the list.
+            if (!std.mem.eql(u8, arg, "theme-pool=")) {
+                self._cli_set_theme_pool = true;
+            }
+        } else if (std.mem.startsWith(u8, arg, "theme=")) {
+            // Empty-value reset (`theme=`) does not count as "setting".
+            if (!std.mem.eql(u8, arg, "theme=")) {
+                self._cli_set_theme = true;
+            }
+        }
+    }
 
     // If we are not loading the default files, then we need to
     // replay the steps up to this point so that we can rebuild
@@ -4390,7 +4457,26 @@ fn expandPaths(self: *Config, base: []const u8) !void {
     }
 }
 
-fn loadTheme(self: *Config, theme: Theme) !void {
+fn loadTheme(self: *Config) !void {
+    // Caller (finalize) guarantees at least one of theme/theme-pool is set.
+    const theme: Theme = theme: {
+        const slots = self.@"theme-pool".list.items;
+        if (slots.len > 0) {
+            const requested: usize = self._conditional_state.theme_slot;
+            const max_slot: usize = slots.len - 1;
+            const slot_idx: usize = @min(requested, max_slot);
+            if (requested > max_slot) {
+                log.debug(
+                    "theme_slot {d} out of range (pool size {d}), " ++
+                        "falling back to slot {d}",
+                    .{ requested, slots.len, slot_idx },
+                );
+            }
+            break :theme slots[slot_idx];
+        }
+        break :theme self.theme orelse return;
+    };
+
     // Load the correct theme depending on the conditional state.
     // Dark/light themes were programmed prior to conditional configuration
     // so when we introduce that we probably want to replace this.
@@ -4434,46 +4520,49 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     var iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
     try new_config.loadIter(alloc_gpa, &iter);
 
-    // Setup our replay to be conditional.
-    conditional: for (new_config._replay_steps.items) |*item| {
-        switch (item.*) {
-            .expand, .diagnostic => {},
+    // Tag each replayed arg with the current (theme, theme_slot) so
+    // changeConditionalState can re-select per surface.
+    const alloc_arena = new_config._arena.?.allocator();
+    const using_pool = self.@"theme-pool".list.items.len > 1;
+    const slot_str: ?[]const u8 = if (using_pool) try std.fmt.allocPrint(
+        alloc_arena,
+        "{d}",
+        .{self._conditional_state.theme_slot},
+    ) else null;
+    const extra: usize = if (using_pool) 2 else 1;
 
+    conditional: for (new_config._replay_steps.items) |*item| {
+        const prior_conds: []const Conditional, const arg_str: []const u8 = switch (item.*) {
+            .expand, .diagnostic => continue,
             // If we see "-e" then we do NOT make the following arguments
             // conditional since they are supposed to be part of the
             // initial command.
             .@"-e" => break :conditional,
+            .arg => |v| .{ &.{}, v },
+            .conditional_arg => |v| .{ v.conditions, v.arg },
+        };
 
-            // Change our arg to be conditional on our theme.
-            .arg => |v| {
-                const alloc_arena = new_config._arena.?.allocator();
-                const conds = try alloc_arena.alloc(Conditional, 1);
-                conds[0] = .{
-                    .key = .theme,
-                    .op = .eq,
-                    .value = @tagName(self._conditional_state.theme),
-                };
-                item.* = .{ .conditional_arg = .{
-                    .conditions = conds,
-                    .arg = v,
-                } };
-            },
-
-            .conditional_arg => |v| {
-                const alloc_arena = new_config._arena.?.allocator();
-                const conds = try alloc_arena.alloc(Conditional, v.conditions.len + 1);
-                conds[0] = .{
-                    .key = .theme,
-                    .op = .eq,
-                    .value = @tagName(self._conditional_state.theme),
-                };
-                @memcpy(conds[1..], v.conditions);
-                item.* = .{ .conditional_arg = .{
-                    .conditions = conds,
-                    .arg = v.arg,
-                } };
-            },
+        const conds = try alloc_arena.alloc(
+            Conditional,
+            prior_conds.len + extra,
+        );
+        conds[0] = .{
+            .key = .theme,
+            .op = .eq,
+            .value = @tagName(self._conditional_state.theme),
+        };
+        if (using_pool) {
+            conds[1] = .{
+                .key = .theme_slot,
+                .op = .eq,
+                .value = slot_str.?,
+            };
         }
+        @memcpy(conds[extra..], prior_conds);
+        item.* = .{ .conditional_arg = .{
+            .conditions = conds,
+            .arg = arg_str,
+        } };
     }
 
     // Replay our previous inputs so that we can override values
@@ -4486,27 +4575,109 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     self.* = new_config;
 }
 
+/// Reconcile `theme` and `theme-pool` when both are set. The rules,
+/// in priority order:
+///
+///   1. If the CLI explicitly set exactly one of the two keys, that
+///      one wins — config files (including those loaded via
+///      `--config-file`) cannot override a CLI flag. This matches the
+///      intuition that CLI args are the boss.
+///   2. Otherwise, scan `_replay_steps` in reverse and pick the
+///      most-recently-assigned key (load-order last-wins). This covers
+///      "both set by CLI" (reverse scan finds the later CLI arg) and
+///      "both set by files" (reverse scan finds the later file entry).
+///
+/// Empty-value `--theme-pool=` steps are not treated as "setting" the
+/// pool — by the time this runs any empty reset has already cleared
+/// the list, so the outer `if` guard handles that case naturally.
+fn resolveThemeVsThemePool(self: *Config) void {
+    const pool_set = self.@"theme-pool".list.items.len > 0;
+    const scalar_set = self.theme != null;
+    if (!pool_set or !scalar_set) return;
+
+    // Rule 1: CLI precedence. If the CLI explicitly set exactly one of
+    // the two keys, that one wins regardless of what happened later in
+    // config-file land.
+    if (self._cli_set_theme and !self._cli_set_theme_pool) {
+        self.@"theme-pool".list.clearRetainingCapacity();
+        return;
+    }
+    if (self._cli_set_theme_pool and !self._cli_set_theme) {
+        self.theme = null;
+        return;
+    }
+
+    // Rule 2: reverse-scan the replay steps for load-order last-wins.
+    var i: usize = self._replay_steps.items.len;
+    while (i > 0) {
+        i -= 1;
+        const step = self._replay_steps.items[i];
+        const raw_arg: []const u8 = switch (step) {
+            .arg => |v| v,
+            .conditional_arg => |v| v.arg,
+            else => continue,
+        };
+        // Strip the leading `--` if present.
+        const arg = if (std.mem.startsWith(u8, raw_arg, "--"))
+            raw_arg[2..]
+        else
+            raw_arg;
+
+        if (std.mem.startsWith(u8, arg, "theme-pool=")) {
+            self.theme = null;
+            return;
+        }
+        if (std.mem.startsWith(u8, arg, "theme=")) {
+            self.@"theme-pool".list.clearRetainingCapacity();
+            return;
+        }
+    }
+
+    // If we reach here, both fields were set but neither appeared in
+    // the replay steps (e.g., programmatic field assignment in tests).
+    // Leave both as-is; loadTheme will prefer the pool.
+}
+
 /// Call this once after you are done setting configuration. This
 /// is idempotent but will waste memory if called multiple times.
 pub fn finalize(self: *Config) !void {
+    // Resolve mutual-clear between `theme` and `theme-pool` based on
+    // load order in _replay_steps.
+    self.resolveThemeVsThemePool();
+
     // We always load the theme first because it may set other fields
     // in our config.
-    if (self.theme) |theme| {
-        const different = !std.mem.eql(u8, theme.light, theme.dark);
+    const pool_len = self.@"theme-pool".list.items.len;
+    const has_theme = self.theme != null or pool_len > 0;
+    if (has_theme) {
+        // Capture whether any slot (or scalar) has a distinct light/dark
+        // pair before loadTheme swaps self out from under us.
+        const any_different_mode = different: {
+            if (self.theme) |t| {
+                if (!std.mem.eql(u8, t.light, t.dark)) break :different true;
+            }
+            for (self.@"theme-pool".list.items) |slot| {
+                if (!std.mem.eql(u8, slot.light, slot.dark)) break :different true;
+            }
+            break :different false;
+        };
 
         // Warning: loadTheme will deinit our existing config and replace
         // it so all memory from self prior to this point will be freed.
-        try self.loadTheme(theme);
+        try self.loadTheme();
 
-        // If we have different light vs dark mode themes, disable
-        // window-theme = auto since that breaks it.
-        if (different) {
-            // This setting doesn't make sense with different light/dark themes
-            // because it'll force the theme based on the Ghostty theme.
+        // If any slot has distinct light/dark, force window-theme=system
+        // and mark theme as conditional (matches prior behavior).
+        if (any_different_mode) {
             if (self.@"window-theme" == .auto) self.@"window-theme" = .system;
-
-            // Mark that we use a conditional theme
             self._conditional_set.insert(.theme);
+        }
+
+        // If the pool has more than one slot, theme_slot varies between
+        // surfaces — mark it as conditional so changeConditionalState
+        // notices changes.
+        if (pool_len > 1) {
+            self._conditional_set.insert(.theme_slot);
         }
     }
 
@@ -9904,6 +10075,135 @@ pub const Theme = struct {
     }
 };
 
+/// A list of Theme entries used by the `theme-pool` config key. Each
+/// entry is a slot — surfaces pick a slot to determine their theme.
+pub const RepeatableTheme = struct {
+    const Self = @This();
+
+    list: std.ArrayListUnmanaged(Theme) = .{},
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
+        const value = input orelse return error.ValueRequired;
+
+        // Empty value resets the list.
+        if (value.len == 0) {
+            self.list.clearRetainingCapacity();
+            return;
+        }
+
+        // Reuse the existing Theme.parseCLI for per-slot parsing so both
+        // single-name and `light:X,dark:Y` syntax work unchanged.
+        var slot: Theme = undefined;
+        try slot.parseCLI(alloc, value);
+        try self.list.append(alloc, slot);
+    }
+
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        var list = try std.ArrayListUnmanaged(Theme).initCapacity(
+            alloc,
+            self.list.items.len,
+        );
+        errdefer {
+            for (list.items) |item| {
+                alloc.free(item.light);
+                alloc.free(item.dark);
+            }
+            list.deinit(alloc);
+        }
+        for (self.list.items) |item| {
+            list.appendAssumeCapacity(try item.clone(alloc));
+        }
+        return .{ .list = list };
+    }
+
+    pub fn equal(self: Self, other: Self) bool {
+        const a = self.list.items;
+        const b = other.list.items;
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (!std.mem.eql(u8, x.light, y.light)) return false;
+            if (!std.mem.eql(u8, x.dark, y.dark)) return false;
+        }
+        return true;
+    }
+
+    pub fn formatEntry(self: Self, formatter: anytype) !void {
+        if (self.list.items.len == 0) {
+            try formatter.formatEntry(void, {});
+            return;
+        }
+        for (self.list.items) |slot| {
+            try slot.formatEntry(formatter);
+        }
+    }
+
+    test "parseCLI single" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try testing.expectEqual(@as(usize, 1), pool.list.items.len);
+        try testing.expectEqualStrings("nord", pool.list.items[0].light);
+        try testing.expectEqualStrings("nord", pool.list.items[0].dark);
+    }
+
+    test "parseCLI light/dark pair" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "light:rose-pine-dawn,dark:rose-pine");
+        try testing.expectEqual(@as(usize, 1), pool.list.items.len);
+        try testing.expectEqualStrings("rose-pine-dawn", pool.list.items[0].light);
+        try testing.expectEqualStrings("rose-pine", pool.list.items[0].dark);
+    }
+
+    test "parseCLI accumulates" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try pool.parseCLI(alloc, "dracula");
+        try pool.parseCLI(alloc, "light:a,dark:b");
+        try testing.expectEqual(@as(usize, 3), pool.list.items.len);
+        try testing.expectEqualStrings("nord", pool.list.items[0].light);
+        try testing.expectEqualStrings("dracula", pool.list.items[1].light);
+        try testing.expectEqualStrings("a", pool.list.items[2].light);
+        try testing.expectEqualStrings("b", pool.list.items[2].dark);
+    }
+
+    test "parseCLI empty resets" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try pool.parseCLI(alloc, "nord");
+        try pool.parseCLI(alloc, "dracula");
+        try pool.parseCLI(alloc, "");
+        try testing.expectEqual(@as(usize, 0), pool.list.items.len);
+    }
+
+    test "parseCLI null errors" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var pool: Self = .{};
+        try testing.expectError(error.ValueRequired, pool.parseCLI(alloc, null));
+    }
+};
+
 pub const Duration = struct {
     /// Duration in nanoseconds
     duration: u64 = 0,
@@ -10644,6 +10944,195 @@ test "theme priority is lower than config" {
     }, cfg.background);
 }
 
+test "theme-pool parses into Config field" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(
+        @as(usize, 2),
+        cfg.@"theme-pool".list.items.len,
+    );
+    try testing.expectEqualStrings("nord", cfg.@"theme-pool".list.items[0].light);
+    try testing.expectEqualStrings("nord", cfg.@"theme-pool".list.items[0].dark);
+    try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].light);
+    try testing.expectEqualStrings("dracula", cfg.@"theme-pool".list.items[1].dark);
+}
+
+test "theme-pool clears scalar theme when set after" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 1), cfg.@"theme-pool".list.items.len);
+}
+
+test "scalar theme clears theme-pool when set after" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=dracula"),
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(@as(usize, 0), cfg.@"theme-pool".list.items.len);
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("nord", cfg.theme.?.light);
+}
+
+test "empty theme-pool does not clear scalar theme" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool="),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("nord", cfg.theme.?.light);
+}
+
+test "theme-pool last-wins across interleaved assignments" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Sequence: pool(a) -> scalar(nord) -> pool(b). Pool wins overall
+    // because the last step assigns theme-pool, and the reverse scan
+    // must find that last entry, not the earlier one.
+    var it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=a"),
+        try alloc_arena.dupeZ(u8, "--theme=nord"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=b"),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 2), cfg.@"theme-pool".list.items.len);
+    try testing.expectEqualStrings("a", cfg.@"theme-pool".list.items[0].light);
+    try testing.expectEqualStrings("b", cfg.@"theme-pool".list.items[1].light);
+}
+
+test "cli theme overrides config-file theme-pool" {
+    // Simulates `ghostty --config-file=X --theme=Nord` where X contains
+    // `theme-pool = ...`. CLI `--theme` should win even though the
+    // config file's pool entries are appended to _replay_steps AFTER
+    // the CLI arg (because loadRecursiveFiles runs after loadCliArgs).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // First, simulate the CLI scalar assignment and mark it as
+    // CLI-originated (as loadCliArgs would).
+    var cli_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=Nord"),
+    } };
+    try cfg.loadIter(alloc, &cli_it);
+    cfg._cli_set_theme = true;
+
+    // Next, simulate a config file loaded via loadRecursiveFiles
+    // appending pool entries to the replay steps AFTER the CLI.
+    var file_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=Dracula"),
+        try alloc_arena.dupeZ(u8, "--theme-pool=Gruvbox Dark"),
+    } };
+    try cfg.loadIter(alloc, &file_it);
+
+    try cfg.finalize();
+
+    // CLI scalar should win — pool must be cleared.
+    try testing.expect(cfg.theme != null);
+    try testing.expectEqualStrings("Nord", cfg.theme.?.light);
+    try testing.expectEqual(@as(usize, 0), cfg.@"theme-pool".list.items.len);
+}
+
+test "cli theme-pool overrides config-file scalar theme" {
+    // Inverse: `ghostty --theme-pool=X --config-file=Y` where Y
+    // contains `theme = Z`. CLI `--theme-pool` should win.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var cli_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme-pool=Dracula"),
+    } };
+    try cfg.loadIter(alloc, &cli_it);
+    cfg._cli_set_theme_pool = true;
+
+    var file_it: TestIterator = .{ .data = &.{
+        try alloc_arena.dupeZ(u8, "--theme=Nord"),
+    } };
+    try cfg.loadIter(alloc, &file_it);
+
+    try cfg.finalize();
+
+    try testing.expect(cfg.theme == null);
+    try testing.expectEqual(@as(usize, 1), cfg.@"theme-pool".list.items.len);
+    try testing.expectEqualStrings(
+        "Dracula",
+        cfg.@"theme-pool".list.items[0].light,
+    );
+}
+
 test "theme loading correct light/dark" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -10884,4 +11373,138 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "theme-pool loads slot 0 background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+
+    // Write two theme files into a tempdir.
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Default theme_slot is 0 → slot A background.
+    try testing.expectEqual(Color{ .r = 0xaa, .g = 0, .b = 0 }, cfg.background);
+}
+
+test "theme-pool clamps out-of-range slot to last valid" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    // Pool has 2 slots; ask for slot 5 → should clamp to slot 1 (last valid).
+    cfg._conditional_state = .{ .theme_slot = 5 };
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(Color{ .r = 0, .g = 0xbb, .b = 0 }, cfg.background);
+}
+
+test "changeConditionalState switches theme-pool slot" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var f = try td.dir.createFile("a", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_a"));
+        try w.end();
+    }
+    {
+        var f = try td.dir.createFile("b", .{});
+        defer f.close();
+        var w = f.writer(&buf);
+        try w.interface.writeAll(@embedFile("testdata/theme_pool_b"));
+        try w.end();
+    }
+    var path_a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_a = try td.dir.realpath("a", &path_a_buf);
+    var path_b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_b = try td.dir.realpath("b", &path_b_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_a}),
+        try std.fmt.allocPrint(alloc_arena, "--theme-pool={s}", .{path_b}),
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Slot 0 → background #aa0000
+    try testing.expectEqual(Color{ .r = 0xaa, .g = 0, .b = 0 }, cfg.background);
+
+    // Flip to slot 1 → background #00bb00
+    var cfg2 = (try cfg.changeConditionalState(.{ .theme_slot = 1 })).?;
+    defer cfg2.deinit();
+    try testing.expectEqual(Color{ .r = 0, .g = 0xbb, .b = 0 }, cfg2.background);
 }
